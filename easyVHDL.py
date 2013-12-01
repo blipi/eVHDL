@@ -1,58 +1,20 @@
 import importlib
+import __main__
 import traceback
 import sys
+import copy
 from collections import OrderedDict
+
+from eWindow import *
+from eTree import *
 
 IN = 0
 OUT = 1
 SIGNAL = 2
 
-class CNode:
-    left , right, data = None, None, 0
-    
-    def __init__(self, data):
-        # initializes the data members
-        self.left = None
-        self.right = None
-        self.data = data
-
-
-class CBOrdTree:
-    def __init__(self):
-        # initializes the root member
-        self.root = None
-    
-    def addNode(self, data):
-        # creates a new node and returns it
-        return CNode(data)
-
-    def insert(self, root, data):
-        # inserts a new data
-        if root == None:
-            # it there isn't any data
-            # adds it and returns
-            return self.addNode(data)
-        else:
-            # enters into the tree
-            if not root.left:
-                # if the data is less than the stored one
-                # goes into the left-sub-tree
-                root.left = self.insert(root.left, data)
-            else:
-                # processes the right-sub-tree
-                root.right = self.insert(root.right, data)
-            return root
-
-    def insertTree(self, root, node):
-        if not root.left:
-            root.left = node
-        else:
-            root.right = node
-        return root
-
 
 class Work(object):
-    _MODULE = importlib.import_module(__name__)
+    _MODULE = __main__ #importlib.import_module(__name__)
     _ME = None
     _TIME = 0
 
@@ -63,10 +25,30 @@ class Work(object):
         EXPR = 3
         ARCH = 4
 
+    class Watcher(object):
+        def __init__(self, default, port):
+            self._x = default
+            self._o = default
+            self._port = port
+
+        @property
+        def x(self):
+            return self._x
+
+        @x.setter
+        def x(self, value):
+            self._o = self._x
+            self._x = value
+            Work()._run_callback(self._port.Name)
+
     def __new__(cls, *args, **kwargs):
         if not cls._ME:
             cls._ME = super(Work, cls).__new__(cls, *args, **kwargs)
             cls._ME.Entities = {}
+            cls._ME._running = False
+            cls._ME._run_c = None
+            cls._ME._run_watch = None
+            cls._ME._run_window = None
 
         return cls._ME
 
@@ -133,7 +115,53 @@ class Work(object):
         if not name in self.Entities:
             raise Exception("Component " + name + " not defined")
         return self.Entities[name]
-    
+
+    def Watch(self, *args):
+        self._run_watch = args
+
+    def Run(self, architecture, to):
+        if not isinstance(architecture, Work._Architecture):
+            raise Exception("Run must be done over a valid architecture")
+
+        if len([port for port,mode in architecture.entity.Modes if mode == IN]) > 0:
+            raise Exception("Only a component with no IN ports can be evaluated")
+
+        self._running = True
+        Work._TIME = 0
+        self._run_c = Component(architecture)
+        self._run_window = eWindows.WaveViewer(self._run_c.arch.name)
+        
+        # We must evaluate the whole sensivity list on 0!
+        for port in self._run_c.arch.Sensivity:
+            for process in self._run_c.arch.Sensivity[port]:
+                process.evaluate(self._run_c)
+
+        self._run_window.update(Work._TIME, self._run_watch[:])
+        
+        # Evaluate all Timed lists until we reach the end
+        for i in range(0, to+1):
+            Work._TIME = i
+            self._run_c()
+            #print "(", self._run_c.arch.a.x, ",",self._run_c.arch.b.x, ",",self._run_c.arch.c.x, ") =", self._run_c.arch.z.x
+
+        # Final waveviewer update
+        self._run_window.update(Work._TIME, self._run_watch[:])          
+
+        self._running = False
+
+    def _run_callback(self, port):
+        if not self._running:
+            return
+
+        if port in self._run_c.arch.Sensivity:
+            for process in self._run_c.arch.Sensivity[port]:
+                process.evaluate(self._run_c)
+
+        if self._run_c.arch.hasSignal(port):
+            signal = getattr(self._run_c.arch, port)
+            if signal in self._run_watch:
+                self._run_window.update(Work._TIME, [signal])
+                        
         
     class _Entity:
         def __init__(self, parent, name):
@@ -208,8 +236,47 @@ class Work(object):
             self.entity = entity
             self.Timed = []
             self.Sensivity = {}
+            self.Signals = []
             self.edone = False
             setattr(entity, name, self)
+
+        def hasSignal(self, signal):
+            return signal in self.Signals
+
+        def Signal(self, *args):
+            if (type(args) == list or type(args) == tuple) and (type(args[0]) == tuple or type(args[0]) == list):
+                for signal in args[0]:
+                    self._addSignal(signal[0], signal[1] if 1 in signal else 0)
+            elif type(args) == tuple :
+                name = args[0]
+                default = args[1] if 1 in args else 0
+
+                self._addSignal(name, default)
+            else:
+                raise Exception("Unknown parameters for Signal");
+
+            return self
+
+        def _addSignal(self, name, default):
+            names = name.split(",")
+            for name in names:
+                if self.entity.hasPort(name):
+                    raise Exception("A port with the same name already exists")
+                
+                if self.hasSignal(name):
+                    raise Exception("Signal is already defined")
+                
+                # Set a global variable for that, in case it doesn't exist
+                try:
+                    signal = getattr(Work._MODULE, name)
+                    if not isinstance(signal, Work._Port):
+                        raise Exception("Conflictive name for signal `" + name + "`")
+                except AttributeError:
+                    setattr(Work._MODULE, name, Work._Port(name))
+                    pass
+                
+                self.Signals.append(name)
+                setattr(self, name, Work.Watcher(default, getattr(Work._MODULE, name)))
 
         class _Process:
             def __init__(self, arch, sensivity):
@@ -248,10 +315,11 @@ class Work(object):
                     raise Exception("Options are not well formatted")
 
                 port = port.Name
-                if not self.arch.entity.hasPort(port):
+                if not self.arch.entity.hasPort(port) and not self.arch.hasSignal(port):
                     raise Exception("Port or Signal `" + port + "` not found on `" + self.arch.entity.name + "`")
 
-                if self.arch.entity.portMode(port) == IN:
+                # If it is a port, it mustn't be IN
+                if self.arch.entity.hasPort(port) and self.arch.entity.portMode(port) == IN:
                     raise Exception("Can not modify an IN Port")
                 
                 # Check if the expr is valid
@@ -279,13 +347,25 @@ class Work(object):
             def evaluate(self, component):
                 if not isinstance(component, Component):
                     raise Exception("A component must be used to evaluate an architecture")
-                
-                events = self.events[Work()._TIME]
+
+                if not self.sensivity:
+                    if not Work()._TIME in self.events:
+                        return
+
+                    events = self.events[Work()._TIME]
+                else:
+                    events = self.events[0]
+    
                 for f,e in events:
                     self.evaluate_i(component, f, e)
 
             def evaluate_i(self, component, f, e):
-                setattr(component, f, self._evaluate_i(component, e))
+                ret = self._evaluate_i(component, e)
+                if self.arch.hasSignal(f):
+                    signal = getattr(self.arch, f)
+                    signal.x = ret
+                else:
+                    setattr(component, f, ret)
 
 
             def _evaluate_i(self, component, event):
@@ -321,7 +401,6 @@ class Work(object):
                 return self
 
             def __exit__(self, e, msg, tb):
-                return False
                 if e:
                     sys.stderr.write("Error: " + str(msg) + "\n")
                     traceback.print_tb(tb, limit=1, file=sys.stderr)
@@ -340,7 +419,7 @@ class Work(object):
                     if not Work().isPort(port):
                         raise Exception("Sensivity list port expected")
 
-                    if not self.entity.hasPort(port.Name):
+                    if not self.hasSignal(port.Name) and not self.entity.hasPort(port.Name):
                         raise Exception("Port or Signal `" + port.Name + "` not found on `" + self.entity.name + "`")
                     
                     if not port.Name in self.Sensivity:
@@ -352,9 +431,9 @@ class Work(object):
             return p
 
         def __call__(self, component, *args):
-            if type(args[0]) == dict:
+            if args and type(args[0]) == dict:
                 sensivity = args[0]
-            else:
+            elif args:
                 sensivity = {}
                 i = 0
                 for port,mode in self.entity.Modes.items():
@@ -373,14 +452,15 @@ class Work(object):
                     for process in self.Sensivity[port.Name]:
                         process.evaluate(component)
 
+            for process in self.Timed:
+                process.evaluate(component)
+
             return self
     
         def __enter__(self, *args):
             return self
 
         def __exit__(self, e, msg, tb):
-            return False
-        
             if self.edone:
                 return True
             
@@ -408,15 +488,16 @@ class Component(object):
         self.entity = architecture.entity
         self.arch = architecture
         self.archmap = None
-        self.lock = False
 
         for port in self.entity.Modes:
-            if self.entity.portMode(port) != OUT:
-                setattr(self, port, getattr(self.entity, port))
-            else:
-                setattr(self, port, self.archCall)
+            setattr(self, port, getattr(self.entity, port))
 
     def archCall(self, *args):
+        for arg in args:
+            atype = Work().getExprType(arg)
+            if atype != Work.ExprType.PORT and atype != Work.ExprType.ARCH:
+                raise Exception("Only Ports or Architectures may be passed to components")
+                
         ports = self._sensivityFromArgs(*args)
         self.archmap.setPorts(ports)
 
@@ -424,27 +505,24 @@ class Component(object):
             if not Work().isBit(ports[port]):
                 return self.archmap
 
-        self.lock = True
         self.arch(self, ports)
-        self.lock = False
         
         return getattr(self, self.archmap.out)
 
     def __getattribute__(self, key):
-        lock = object.__getattribute__(self, "lock")
-        if lock:
+        # When runing, we want the int value, not the architecture binding!
+        if Work()._running:
             return object.__getattribute__(self, key)
         
         try:
             port = object.__getattribute__(self, key)
             entity = object.__getattribute__(self, "entity")
+            archCall = object.__getattribute__(self, "archCall")
 
             if entity.hasPort(key):
-                #if entity.portMode(key) != OUT:
-                    #raise Exception("Port " + key + " is not OUT")
-                #else:
                 if entity.portMode(key) == OUT:
                     self.archmap = _ArchMap(self, key)
+                    return archCall
             
             return port
                 
@@ -458,24 +536,25 @@ class Component(object):
             if not Work().isBit(ports[port]):
                 raise Exception("Direct call must be done with bits only")
 
-        self.lock = True
         self.arch(self, ports)
-        self.lock = False
         
         return self
 
     def _sensivityFromArgs(self, *args):
-        if type(args[0]) == dict:
-            ports = args[0]
+        if not args:
+            ports = ()
         else:
-            ports = {}
-            i = 0
-            for port,mode in self.entity.Modes.items():
-                if mode == IN:
-                    ports[getattr(Work()._MODULE, port)] = args[i]
-                    i += 1
-                    if i >= len(args):
-                        break
+            if type(args[0]) == dict:
+                ports = args[0]
+            else:
+                ports = {}
+                i = 0
+                for port,mode in self.entity.Modes.items():
+                    if mode == IN:
+                        ports[getattr(Work()._MODULE, port)] = args[i]
+                        i += 1
+                        if i >= len(args):
+                            break
 
         if len(ports) < len([port for port,mode in self.entity.Modes.items() if mode == IN]):
             raise Exception("Not all IN ports have a valid entry")
@@ -492,21 +571,23 @@ class _ArchMap:
         self.sensivity = ports
 
     def __call__(self, expr0=None, expr1=None):
-        self.component.lock = True
-
         for port in self.sensivity:
             value = self.sensivity[port]
-
             ptype = Work().getExprType(value)
             if ptype == Work.ExprType.PORT:
                 if not isinstance(expr0, Component):
                     raise Exception("Can not call a component architecture by an out port without using a valid component")
-                
-                setattr(self.component, port.Name, getattr(expr0, value.Name))
+
+                if expr0.arch.hasSignal(value.Name):
+                    signal = getattr(expr0.arch, value.Name)
+                    setattr(self.component, port.Name, signal.x)
+                else:
+                    setattr(self.component, port.Name, getattr(expr0, value.Name))
+
             elif ptype == Work.ExprType.ARCH:
                 if not isinstance(expr0, Component):
                     raise Exception("Can not call a component architecture by an out port without using a valid component")
-                
+
                 value(expr0)
                 archres = getattr(value.component, value.out)
                 setattr(self.component, port.Name, archres)
@@ -518,8 +599,8 @@ class _ArchMap:
                 for process in self.component.arch.Sensivity[port.Name]:
                     process.evaluate(self.component)
 
-        self.component.lock = False
-        return getattr(self.component, self.out)
+        ret = getattr(self.component, self.out)
+        return ret
 
 
 class _BasicGate(object):
@@ -545,26 +626,6 @@ class _BasicGate(object):
             else:           
                 tree.insert(self.Tree, expr1)
 
-    """
-    def __call__(self, expr0, expr1=None):
-        if expr1 == None:
-            self.__init__(expr0)
-        else:
-            self.__init__(expr0, expr1)
-        return self
-    
-    def __getattribute__(self, key):
-        try:
-            return object.__getattribute__(self, key)
-        except AttributeError as e:
-            try:
-                c = getattr(Work._MODULE, key)
-                c = c.__new__(c)
-                c.trees = self.trees
-                return c
-            except AttributeError:
-                raise Exception("Gate " + key + " does not exist")
-    """
     
 class NOT(_BasicGate):
     def __init__(self, expr):
@@ -590,103 +651,4 @@ class XOR(_BasicGate):
     def __call__(self, expr0, expr1):
         return expr0 ^ expr1
                         
-def test():
-    # Entity declaration, best way
-    with Entity("INV"):
-        # Assignin ports to the entity (ORDER MATTERS!, a b z != b a z)
-        INV.Port([
-            ["a", IN],
-            ["z", OUT]
-        ])
-        
-    with Entity("AND2"):
-        AND2.Port([
-            ["b", IN],
-            ["a", IN],
-            ["z", OUT]
-        ])
-     
-    with Entity("NAND2"):
-        NAND2.Port([
-            ["a", IN],
-            ["b", IN],
-            ["z", OUT]
-        ])
-        
-    with Entity("OR2"):
-        OR2.Port([
-            ["a", IN],
-            ["b", IN],
-            ["z", OUT]
-        ])
-     
-    with Entity("NOR2"):
-        NOR2.Port([
-            ["a", IN],
-            ["b", IN],
-            ["z", OUT]
-        ])
-        
-    with Entity("OR3"):
-        OR3.Port([
-            ["a", IN],
-            ["b", IN],
-            ["c", IN],
-            ["z", OUT]
-        ])
 
-    Entity("Testbench")
-
-    # Architecture declaration
-    # We can assign it a variable, `logic`, or access it through `AND2.logic`
-    with Architecture(INV, "logic") as logic:
-        with logic.Process((a,)) as process:
-            process(z, NOT(a))
-            
-    with Architecture(AND2, "logic") as logic:
-        with logic.Process((a,b)) as process:
-            process(z, AND(a, b))
-
-    with Architecture(NAND2, "logic") as logic:
-        cINV = Component(INV.logic)
-        cAND2 = Component(AND2.logic)
-        with logic.Process((a,b)) as process:
-            process(z, cINV.z(cAND2.z(a, b)))
-            
-    with Architecture(OR2, "logic") as logic:
-        with logic.Process((a,b)) as process:
-            process(z, OR(a, b))
-
-    with Architecture(NOR2, "logic") as logic:
-        cINV = Component(INV.logic)
-        cOR2 = Component(OR2.logic)
-        with logic.Process((a,b)) as process:
-            process(z, cINV.z(cOR2.z(a, b)))
-            
-    with Architecture(OR3, "logic") as logic:
-        with logic.Process((a,b,c)) as process:
-            process(z, OR(OR(a, b), c))
-
-    with Architecture(Testbench, "test") as test:
-        with test.Process() as process:
-            process(a, 
-
-
-    # Crida directa, evalua totes les sortides
-    # Els valors (0, 1) s'associen a les entrades tal i com les hem declarat i
-    # en el mateix ordre
-    cNOR2 = Component(NOR2.logic)
-    print cNOR2(0,1), cNOR2.z
-
-    # Crida a la sortida z, retorna el valor directament
-    cNAND2 = Component(NAND2.logic)
-    print cNAND2.z(1,0)
-    
-    cOR3 = Component(OR3.logic)
-    print cOR3.z(1,0,0)
-
-    # Crida directa a la sortida indicant explicitament el valor de cada entrada
-    cOR3 = Component(OR3.logic)
-    print cOR3.z({a: 0, b:0, c:0})
-
-test()
