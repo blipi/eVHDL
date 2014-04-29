@@ -44,13 +44,21 @@ class eWindows(threading.Thread):
         return cls._ME.outQueue.get(True)
 
     def run(self):
-        eWindows._APP = wx.PySimpleApp(redirect=False)
+        eWindows._APP = wx.App(False)
         eWindows._WX = self.Frame("eVHDL", (1000, 600))
         eWindows._WX.Show(True)
-        
-        while eWindows._RUNNING: 
+
+        menubar = wx.MenuBar()
+        eWindows._WX.SetMenuBar(menubar)
+        eWindows._WX.CreateStatusBar()
+
+        evtloop = wx.EventLoop()
+        old = wx.EventLoop.GetActive()
+        wx.EventLoop.SetActive(evtloop)
+                
+        while eWindows._RUNNING:
             while eWindows._APP.Pending(): 
-                eWindows._APP.Dispatch()  
+                eWindows._APP.Dispatch()            
 
             while not self.inQueue.empty():
                 e,arg = self.inQueue.get()
@@ -66,9 +74,10 @@ class eWindows(threading.Thread):
                     parent.sizer.Add(w,pos,span,wx.EXPAND)
                     parent.sizer.Fit(parent)
 
-            eWindows._APP.Yield()
-            sleep(0.2)
+            sleep(0.01)
             eWindows._APP.ProcessIdle()
+
+        wx.EventLoop.SetActive(old)
     
     class WaveViewer:
         class Graph(wx.Panel):
